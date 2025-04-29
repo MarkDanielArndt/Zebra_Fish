@@ -16,7 +16,7 @@ from torch.nn import CrossEntropyLoss
 from sklearn.model_selection import train_test_split
 import json
 import tensorflow as tf
-from tensorflow.keras.applications import VGG16, ResNet50, MobileNetV2, VGG19
+from tensorflow.keras.applications import VGG16, ResNet50, MobileNetV2, VGG19, ResNet101
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Dense, Flatten, Dropout
 from tensorflow.keras.regularizers import l1
@@ -25,6 +25,7 @@ from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.applications.vgg16 import preprocess_input as preprocess_input_vgg16
 from tensorflow.keras.applications.vgg19 import preprocess_input as preprocess_input_vgg19
 from tensorflow.keras.applications.resnet50 import preprocess_input as preprocess_input_resnet
+from tensorflow.keras.applications.resnet import preprocess_input as preprocess_input_resnet101
 from tensorflow.keras.applications.mobilenet_v2 import preprocess_input as preprocess_input_mobilenet
 from tensorflow.keras.utils import to_categorical
 from sklearn.metrics import confusion_matrix
@@ -35,7 +36,7 @@ from PIL import Image
 import copy
 import random  # For random sampling
 from sklearn.model_selection import ParameterGrid
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, f1_score
 import copy
 from cluster_helper import load_and_recreate_masked_images, preprocess_masked_images, segment_fish, apply_segmentation_model, fill_holes, grow_mask, balance_dataframe, create_data_and_labels
 
@@ -60,6 +61,7 @@ if User=="Mark":
 
     #3. Train, Val, Test Split
     skip_train = False
+    retrain = True
     train_size = 0.6
     val_size = 0.2
     test_size = 0.2
@@ -82,7 +84,7 @@ if User=="Mark":
     # HP Tuning
     hp_tuning = True
     hp_dense_layer = [512]
-    hp_lr = [1e-5]
+    hp_lr = [2e-5] #Learning rate for Adam optimizer
 
     #Use trained model for mask segmentation of images
     use_seg_model = True
@@ -119,7 +121,7 @@ if User=="Mark":
     
     cnn_learning_rate = 0.001
     cnn_loss = 'crossentropy'
-    cnn_num_epochs = 15
+    cnn_num_epochs = 50
     cnn_num_epochs_pre = 5
     dense_layer = 512
     dropout = 0.3
@@ -149,6 +151,44 @@ df_result["Grown Masks"] = df_result["Filled Masks"].apply(grow_mask, iterations
 
 #Apply segmented masks to the images and change columen name of masked images
 #Preprocess masked images and create the column "processed_image"
+masked_images = []
+
+for idx, row in df_result.iterrows():
+    img_path = row["Images"]
+    #!!!currently the origninal masks are used!!!
+    mask = row["Grown Masks"]
+
+    # Load the original image
+    original_image = cv2.imread(img_path)  # Load raw image
+    
+    # Resize image to match mask size
+    original_image = cv2.resize(original_image, target_size, interpolation=cv2.INTER_LINEAR)
+
+    # Ensure mask is in correct format
+    if isinstance(mask, str):  # If it's a file path
+        mask = cv2.imread(mask, cv2.IMREAD_GRAYSCALE)
+        mask = cv2.resize(mask, target_size, interpolation=cv2.INTER_NEAREST)
+
+    elif isinstance(mask, Image.Image):  # If it's a PIL image
+        mask = np.array(mask)
+
+    elif isinstance(mask, np.ndarray):
+        mask = cv2.resize(mask, target_size, interpolation=cv2.INTER_NEAREST)
+
+    # Ensure mask is binary (0 or 255)
+    mask = (mask > 0).astype(np.uint8)
+
+    # Convert mask to 3 channels (so it can be applied to RGB image)
+    mask_3ch = np.stack([mask] * 3, axis=-1)
+
+    # Apply the mask to the image
+    masked_image = original_image * mask_3ch
+
+    # Append result
+    masked_images.append(masked_image)
+
+# Overwrite the "Masked Images" column
+df_result["Masked Images"] = masked_images
 
 df_result = preprocess_masked_images(df_result, target_size)
 
@@ -156,8 +196,8 @@ df_result = preprocess_masked_images(df_result, target_size)
 if load_with_split and label_name == "Curved":
     
     # Create separate DataFrames based on "split_by_curve"
-    df_train = df_result[df_result["split_by_curve"] == 0].reset_index(drop=True)
-    df_val = df_result[df_result["split_by_curve"] == 1].reset_index(drop=True)
+    df_train = df_result[(df_result["split_by_curve"] == 0) | (df_result["split_by_curve"] == 1)].reset_index(drop=True)
+    df_val = df_result[df_result["split_by_curve"] == 2].reset_index(drop=True)
     df_test = df_result[df_result["split_by_curve"] == 2].reset_index(drop=True)
 
 elif load_with_split and label_name != "Curved":
@@ -244,10 +284,10 @@ X_val = normalize_images(val_data)
 X_test = normalize_images(test_data)
 
 # Preprocess input data for VGG16 (standardize based on ImageNet)
-X_train = preprocess_input_resnet(X_train)
-X_val = preprocess_input_resnet(X_val)
+X_train = preprocess_input_resnet101(X_train)
+X_val = preprocess_input_resnet101(X_val)
 X_test_copy = copy.deepcopy(X_test)
-X_test = preprocess_input_resnet(X_test)
+X_test = preprocess_input_resnet101(X_test)
 
 # Convert labels to NumPy arrays
 y_train = np.array(train_labels) - 1
@@ -257,6 +297,30 @@ y_test = np.array(test_labels) - 1
 y_train = to_categorical(y_train, num_classes=num_classes)
 y_val = to_categorical(y_val, num_classes=num_classes)
 y_test = to_categorical(y_test, num_classes=num_classes)
+
+@tf.keras.utils.register_keras_serializable()
+class F1Score(tf.keras.metrics.Metric):
+    def __init__(self, name='f1_score', **kwargs):
+        super(F1Score, self).__init__(name=name, **kwargs)
+        self.precision = tf.keras.metrics.Precision()
+        self.recall = tf.keras.metrics.Recall()
+
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_pred = tf.round(y_pred)
+        self.precision.update_state(y_true, y_pred, sample_weight)
+        self.recall.update_state(y_true, y_pred, sample_weight)
+
+    def result(self):
+        p = self.precision.result()
+        r = self.recall.result()
+        return 2 * ((p * r) / (p + r + tf.keras.backend.epsilon()))
+
+    def reset_states(self):
+        self.precision.reset_states()
+        self.recall.reset_states()
+
+# Instantiate the custom F1 metric
+f1 = F1Score()
 
 if Model_type == "CNN" and hp_tuning == True and skip_train == False:
     
@@ -280,7 +344,7 @@ if Model_type == "CNN" and hp_tuning == True and skip_train == False:
         print(f"Training with params: {params}")
 
         
-        vgg16 = ResNet50(weights='imagenet', include_top=False, input_shape=input_shape)
+        vgg16 = ResNet101(weights='imagenet', include_top=False, input_shape=input_shape)
 
         # Freeze all layers in the pre-trained model
         for layer in vgg16.layers:
@@ -298,11 +362,10 @@ if Model_type == "CNN" and hp_tuning == True and skip_train == False:
         # Create a training data generator with data augmentation
         train_generator = train_datagen.flow(X_train, y_train, batch_size=32)
 
-        # Compile the model
         model.compile(
-            optimizer=Adam(learning_rate=params['learning_rate']),  # Optimizer with specified learning rate
-            loss=cnn_loss,  # Binary cross-entropy loss for binary classification
-            metrics=['accuracy']  # Track accuracy during training
+            optimizer=Adam(learning_rate=params['learning_rate']),
+            loss=cnn_loss,
+            metrics=['accuracy', f1]  # Include F1 score as a metric
         )
 
         # Train the model
@@ -319,11 +382,12 @@ if Model_type == "CNN" and hp_tuning == True and skip_train == False:
         # Define a callback to save the best model based on validation accuracy
         checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
             filepath=os.path.join(cnn_log_directory, 'best_model.keras'),
-            monitor='val_accuracy',
+            monitor='val_f1_score',
             save_best_only=True,
             mode='max',
             verbose=1
         )
+
 
         # Train the model
         history2 = model.fit(
@@ -379,4 +443,67 @@ if Model_type == "CNN" and hp_tuning == True and skip_train == False:
     test_true_classes = np.argmax(y_test, axis=1)
     test_accuracy = accuracy_score(test_true_classes, test_pred_classes)
 
+
     print(f"Test accuracy: {test_accuracy:.4f}")
+
+# if retrain:
+
+#     best_model_save_path = os.path.join(cnn_log_directory, 'final_best_model.keras')
+#     best_model = tf.keras.models.load_model(best_model_save_path)
+
+#     train_generator = train_datagen.flow(X_train, y_train, batch_size=32)
+
+# # Define a callback to save the best model based on validation accuracy
+#     checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
+#         filepath=os.path.join(cnn_log_directory, 'best_model.keras'),
+#         monitor='val_accuracy',
+#         save_best_only=True,
+#         mode='max',
+#         verbose=1
+#     )
+
+#     # Train the model
+#     history2 = best_model.fit(
+#         train_generator,  # Use the augmented data generator for training
+#         epochs=5,  # Train for specified epochs
+#         validation_data=(X_val, y_val),  # Use the validation set for evaluation
+#         callbacks=[checkpoint_callback]  # Include the checkpoint callback
+#     )
+
+#     # Load the best model after training
+#     best_model_path = os.path.join(cnn_log_directory, 'best_model.keras')
+#     best_model = tf.keras.models.load_model(best_model_path)
+#     print(f"Best model loaded from {best_model_path}")
+
+#     # Evaluate the best model on the test set
+#     test_predictions = best_model.predict(X_test)
+#     test_pred_classes = np.argmax(test_predictions, axis=1)
+#     test_true_classes = np.argmax(y_test, axis=1)
+#     test_accuracy = accuracy_score(test_true_classes, test_pred_classes)
+
+
+#     print(f"Test accuracy: {test_accuracy:.4f}")
+
+
+# Plot the first 5 images of X_test
+plt.figure(figsize=(15, 5))
+for i in range(5):
+    plt.subplot(1, 5, i + 1)
+    plt.imshow((X_test_copy[i] * 255).astype(np.uint8))  # Convert back to uint8 for display
+    plt.title(f"Label: {np.argmax(y_test[i])}")
+    plt.axis('off')
+plt.tight_layout()
+plt.show()
+# Save the best model to a file
+best_model_save_path = os.path.join(cnn_log_directory, 'final_best_model.keras')
+best_model = tf.keras.models.load_model(best_model_save_path)
+
+
+# Evaluate the best model on the test set
+test_predictions = best_model.predict(X_test)
+test_pred_classes = np.argmax(test_predictions, axis=1)
+test_true_classes = np.argmax(y_test, axis=1)
+test_accuracy = accuracy_score(test_true_classes, test_pred_classes)
+
+
+print(f"Test accuracy: {test_accuracy:.4f}")
